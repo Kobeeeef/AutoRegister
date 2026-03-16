@@ -3,78 +3,123 @@ import json
 import time
 from datetime import datetime
 from selenium import webdriver
-from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import configparser
 import os
 import sys
 import re
+import html
+from urllib.parse import quote
+
+
+ACTIVE_BROWSER = None
+SESSION_DATA = None
 
 
 def main():
+    global ACTIVE_BROWSER
     print(getNow(), "Initializing AutoRegister...")
     fileName = getFileName()
     config = initializeConfig(fileName)
     if config:
-        browser = webdriver.Chrome(config['setup']['driverPath'])
+        browser = createBrowser(config)
+        ACTIVE_BROWSER = browser
         login(browser, config['setup']['username'],
               config['setup']['password'])
         if not checkLogin(browser):
             term = getTerm(browser)
             enrolled = getEnrolledClass(browser)
+            cartCourses = getCartCourses(browser)
 
             times = getEnrolledTime(enrolled, term)
             credits = getTotalCredits(browser)
             courses = initializeCourses(config, enrolled)
-            writeCoursesToConfig(config, courses, fileName)
+            if len(courses) > 0:
+                writeCoursesToConfig(config, courses, fileName)
             timeBlacklist = generateTimeBlacklist(courses, times, term)
             restrictedBlacklist = initializeBlacklist(config, courses)
             writeBlacklistToConfig(config, restrictedBlacklist, fileName)
             goal = int(config['class']['goal'])
+            if goal <= credits and len(courses) > 0:
+                goal = credits + 1
+                print(f"Configured goal is not above current credits. Using temporary goal of {goal}.")
             print("Checking for availability for:")
             for course in courses:
                 print(course)
+            if len(courses) == 0 and config['class']['class'].strip():
+                print("Falling back to cart-driven mode. Import the target section into your Registration Cart.")
             print("Please do not manually drop or sign up classes. \n")
             last = []
             interval = 3600 * 9 # 3 hours
             nextRefresh = time.time() + interval
-            while len(courses) > 0 and credits < goal: 
+            cartPollSeconds = int(config['class'].get('cartPollSeconds', '60'))
+            while credits < goal:
                 if time.time() >= nextRefresh:
-                    addClass(browser, {})
+                    browser.refresh()
+                    waitForRegistrationPage(browser)
                     print(getNow(), "Refreshing page.")
                     if checkLogin(browser):
                         login(browser, config['setup']['username'],
                               config['setup']['password'])
                         print("Logged out. Logging back in.")
                     nextRefresh = time.time() + interval
-                openList = getClassStatus(
-                    courses, term, timeBlacklist, restrictedBlacklist)
-                if len(openList) > 0 and last != openList:
-                    addClass(browser, openList)
-                    enrolled = getEnrolledClass(browser)
-                    credits = getTotalCredits(browser)
-                    deleteList = set()
-                    for course in courses:
-                        if course in enrolled:
-                            print("Enrolled in", course)
-                            deleteList.add(course)
-                            writeCoursesToConfig(config, courses, fileName)
-                            times = getEnrolledTime(enrolled, term)
-                            timeBlacklist = generateTimeBlacklist(
-                                courses, times, term)
-                    for delete in deleteList:
-                        courses.remove(delete)
-                    getMessage(browser, restrictedBlacklist, config)
-                    writeBlacklistToConfig(
-                        config, restrictedBlacklist, fileName)
-                last = openList
-                time.sleep(5)
-            if len(courses) == 0:
+                if len(courses) > 0:
+                    openList = getClassStatus(
+                        courses, term, timeBlacklist, restrictedBlacklist)
+                    if len(openList) > 0 and last != openList:
+                        addClass(browser, openList)
+                        enrolled = getEnrolledClass(browser)
+                        credits = getTotalCredits(browser)
+                        deleteList = set()
+                        for course in courses:
+                            if course in enrolled:
+                                print("Enrolled in", course)
+                                deleteList.add(course)
+                                writeCoursesToConfig(config, courses, fileName)
+                                times = getEnrolledTime(enrolled, term)
+                                timeBlacklist = generateTimeBlacklist(
+                                    courses, times, term)
+                        for delete in deleteList:
+                            courses.remove(delete)
+                        getMessage(browser, restrictedBlacklist, config)
+                        writeBlacklistToConfig(
+                            config, restrictedBlacklist, fileName)
+                    last = openList
+                    if len(courses) == 0:
+                        break
+                    time.sleep(5)
+                    continue
+                targetCartEntries = getTargetCartEntries(browser, config)
+                if len(targetCartEntries) > 0:
+                    openEntries = []
+                    for entry in targetCartEntries:
+                        if isCartEntryOpen(entry, term):
+                            openEntries.append(entry)
+                    if len(openEntries) > 0:
+                        print(getNow(), "Target cart section is open. Attempting Update Schedule.")
+                        submitCart(browser)
+                        getMessage(browser, restrictedBlacklist, config)
+                        enrolled = getEnrolledClass(browser)
+                        credits = getTotalCredits(browser)
+                        if hasTargetEnrolled(enrolled, config):
+                            print("Enrolled in target cart course.")
+                            break
+                    else:
+                        print(getNow(), "Target course is in the Registration Cart, but the section is still closed.")
+                else:
+                    print(getNow(), "Target course is not in the Registration Cart yet.")
+                time.sleep(cartPollSeconds)
+            if len(courses) == 0 and hasTargetEnrolled(enrolled, config):
                 print('All classes added.')
             elif credits >= goal:
                 print('Credit minimum reached.')
+            elif hasTargetEnrolled(enrolled, config):
+                print('Target course added from cart.')
         else:
             print("Login failed.")
-    input("Press Enter to continue...")
 
 
 def getFileName():
@@ -89,18 +134,22 @@ def initializeConfig(fileName):
     config = configparser.ConfigParser()
     if not os.path.exists(fileName):
         config['setup'] = {
-            'username': 'Enter your UW NetID here',
-            'password': 'Enter your password here',
-            'driverPath': 'Enter the path of the Chrome driver or download at http://chromedriver.chromium.org/'
+            'username': '',
+            'password': '',
+            'driverPath': '',
+            'chromeUserDataDir': '',
+            'chromeProfileDirectory': 'Default'
         }
         config['class'] = {
-            'class': 'Enter the classes you want to sign up, separated by a comma',
-            'goal': 'Enter the minimum number of credits you wish to take',
-            'blacklist': '' 
+            'class': 'PSYCH 210',
+            'goal': '18',
+            'blacklist': '',
+            'cartPollSeconds': '60'
         }
         config.write(open(fileName, 'w'))
         print('Config file created at ', fileName)
-        return
+        config.read(fileName)
+        return config
     else:
         print("Config found at", fileName)
         config.read(fileName)
@@ -108,37 +157,42 @@ def initializeConfig(fileName):
 
 
 def login(browser, id, pw):
-    browser.get("https://sdb.admin.uw.edu/students/uwnetid/register.asp")
-    username = browser.find_element_by_id("weblogin_netid")
-    password = browser.find_element_by_id("weblogin_password")
-    username.clear()
-    password.clear()
-    username.send_keys(id)
-    password.send_keys(pw)
-    browser.find_element_by_name("_eventId_proceed").click()
+    browser.get("https://register.uw.edu/register/")
+    print("Manual login required. Complete the UW login and land on the registration page in the browser window.")
+    try:
+        waitForRegistrationPage(browser, timeout=600)
+    except Exception:
+        print("Login timeout reached before the registration page loaded.")
 
 
 def checkLogin(browser):
-    return len(browser.find_elements_by_name("_eventId_proceed")) > 0
+    return not isRegistrationPage(browser)
 
 
 def getTerm(browser):
-    elem = browser.find_elements_by_xpath(
-        "/html/body/div[2]/table[3]/tbody/tr/td[1]/h1[1]")
-    return elem[0].text.replace('Registration - ', '')
+    waitForRegistrationPage(browser)
+    title = browser.title.strip()
+    if " - Register.UW" in title:
+        return title.replace(" - Register.UW", "")
+    elem = browser.find_element(By.ID, "reg-quarter")
+    return elem.text.replace("Your ", "").replace(" Schedule", "")
 
 
 def getEnrolledClass(browser):
-    elems = browser.find_elements_by_xpath(
-        "/html/body/div[2]/form[1]/p/table[1]/tbody/tr[position() > 2]/td[3]")
     res = {}
-    for e in elems:
-        split = e.text.split()
-        if len(split) > 0:
-            enrolledClass = split[0] + ' ' + split[1]
+    rows = browser.find_elements(By.CSS_SELECTOR, "#reg-current tbody tr")
+    for row in rows:
+        cells = row.find_elements(By.CSS_SELECTOR, "th, td")
+        if len(cells) >= 2:
+            split = cells[1].text.split()
+            if len(split) >= 3:
+                enrolledClass = split[0] + ' ' + split[1]
+                section_code = split[2]
+            else:
+                continue
             if not enrolledClass in res:
                 res[enrolledClass] = set()
-            res[enrolledClass].add(split[2])
+            res[enrolledClass].add(section_code)
     return res
 
 
@@ -158,36 +212,40 @@ def getEnrolledTime(enrolled, term):
 
 
 def getTotalCredits(browser):
-    elem = browser.find_element_by_xpath(
-        "/html/body/div[2]/form[1]/p/table[1]/tbody/tr[last()]/td[1]")
-    split = elem.text.split()
-    return 0 if not split else int(float(split[len(split)-1]))
+    text = browser.find_element(By.CSS_SELECTOR, "#reg-current .lead").text
+    match = re.search(r"Registered Credits:\s*(\d+)", text)
+    return int(match.group(1)) if match else 0
 
 
 def addClass(browser, openList):
-    max = getMax(browser)
-    courses = list(openList.keys())
-    for i in range(8):
-        form = browser.find_element_by_name("sln" + str(max + 1 + i))
-        form.clear()
-        if i < len(courses):
-            form.send_keys(courses[i])
-            print(getNow(), "Attempting to enroll in",
-                  openList[courses[i]])
-    browser.find_element_by_xpath(
-        '//input[@value=\' Update Schedule \']').click()
+    if len(openList) == 0:
+        return
+    for registrationCode, courseName in openList.items():
+        addToCart(browser, registrationCode)
+        print(getNow(), "Attempting to enroll in", courseName)
+    submit = WebDriverWait(browser, 30).until(
+        EC.element_to_be_clickable((By.ID, "submit-registration"))
+    )
+    submit.click()
+    time.sleep(2)
 
 
 def getMessage(browser, restrictedBlacklist, config):
-    elems = browser.find_elements_by_xpath(
-        "/html/body/div[2]/form[1]/p[2]/table[1]/tbody/tr[position() > 1]/td[5]")
-    for e in elems:
-        if len(e.text.strip()) > 0:
-            print(e.text)
-        if "Restricted section" in e.text:
-            restricted = e.text.split(':')[0]
-            restrictedBlacklist.add(restricted)
-            print(restricted, "added to blacklist")
+    messages = set()
+    selectors = [
+        "[role='alert']",
+        ".alert",
+        "#sln-suggest-messages",
+        ".toast",
+        ".invalid-feedback",
+    ]
+    for selector in selectors:
+        for elem in browser.find_elements(By.CSS_SELECTOR, selector):
+            text = elem.text.strip()
+            if text:
+                messages.add(text)
+    for message in sorted(messages):
+        print(message)
 
 
 def getCourseName(parser):
@@ -321,6 +379,8 @@ def initializeBlacklist(config, courses):
 
 
 def writeCoursesToConfig(config, courses, fileName):
+    if len(courses) == 0:
+        return
     res = ""
     if len(courses) > 0:
         courseList = list(courses)
@@ -345,26 +405,205 @@ def writeBlacklistToConfig(config, blacklist, fileName):
 
 
 def getCourseJson(course):
-    page = None
-    try:
-        page = requests.get(getCourseLink(course), timeout=30)
-    except:
-        print(getNow(), getCourseLink(course),
-              "error while attempting to load")
-    if page and page.status_code == 200:
-        return page.json()
+    response = browserFetchJson(getCourseLink(course))
+    if response and response.get("ok") and isinstance(response.get("json"), dict):
+        return response["json"]
+    status = response.get("status") if response else "unknown"
+    print(getNow(), getCourseLink(course), f"error while attempting to load (status: {status})")
 
 
 def getCourseLink(course):
-    return 'https://myplan.uw.edu/course/api/courses/' + course + '/details'
+    session = getSessionData()
+    host = session.get("application", {}).get("myplan_hostname", "https://myplan.uw.edu")
+    context = session.get("application", {}).get("myplan_context", "")
+    base = host.rstrip("/")
+    if context:
+        base += "/" + context.strip("/")
+    return base + "/course/api/courses/" + quote(course) + "/details"
 
 
 def getMax(browser):
-    return int(browser.find_element_by_name("maxdrops").get_attribute('value'))
+    return 0
 
 
 def getNow():
     return datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def createBrowser(config):
+    driverPath = config['setup'].get('driverPath', '').strip()
+    chromeUserDataDir = config['setup'].get('chromeUserDataDir', '').strip()
+    chromeProfileDirectory = config['setup'].get('chromeProfileDirectory', '').strip()
+    if not chromeUserDataDir:
+        localAppData = os.environ.get("LOCALAPPDATA", "").strip()
+        if localAppData:
+            defaultChromeDir = os.path.join(localAppData, "Google", "Chrome", "User Data")
+            if os.path.isdir(defaultChromeDir):
+                chromeUserDataDir = defaultChromeDir
+    options = webdriver.ChromeOptions()
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    if chromeUserDataDir:
+        options.add_argument(f"--user-data-dir={chromeUserDataDir}")
+    if chromeProfileDirectory:
+        options.add_argument(f"--profile-directory={chromeProfileDirectory}")
+    if driverPath:
+        return webdriver.Chrome(service=Service(driverPath), options=options)
+    return webdriver.Chrome(options=options)
+
+
+def needsManualLogin(id, pw):
+    return True
+
+
+def isRegistrationPage(browser):
+    return (
+        "register.uw.edu/register/" in browser.current_url and
+        len(browser.find_elements(By.ID, "react_app")) > 0 and
+        len(browser.find_elements(By.ID, "submit-registration")) > 0 and
+        len(browser.find_elements(By.ID, "sln-suggest")) > 0
+    )
+
+
+def waitForRegistrationPage(browser, timeout=120):
+    WebDriverWait(browser, timeout).until(lambda driver: isRegistrationPage(driver))
+
+
+def addToCart(browser, registrationCode):
+    input_elem = WebDriverWait(browser, 30).until(
+        EC.element_to_be_clickable((By.ID, "sln-suggest"))
+    )
+    input_elem.clear()
+    input_elem.send_keys(registrationCode)
+    add_button = browser.find_element(By.CSS_SELECTOR, "#sln-suggest-form button[type='submit']")
+    add_button.click()
+    WebDriverWait(browser, 30).until(
+        lambda driver: driver.find_element(By.ID, "sln-suggest").get_attribute("value") in ("", None)
+    )
+
+
+def getCartCourses(browser):
+    courses = []
+    rows = browser.find_elements(By.CSS_SELECTOR, "#reg-cart tbody tr")
+    for row in rows:
+        cells = row.find_elements(By.CSS_SELECTOR, "th, td")
+        if len(cells) >= 2:
+            sln = cells[0].text.strip()
+            text = cells[1].text.strip()
+            if text:
+                courses.append({"sln": sln, "course": text})
+    return courses
+
+
+def hasTargetInCart(browser, config):
+    targets = getConfiguredTargets(config)
+    for entry in getCartCourses(browser):
+        for target in targets:
+            if entry["course"].upper().startswith(target.upper()):
+                return True
+    return False
+
+
+def hasTargetEnrolled(enrolled, config):
+    targets = getConfiguredTargets(config)
+    for course in enrolled:
+        for target in targets:
+            if course.upper().startswith(target.upper()):
+                return True
+    return False
+
+
+def getConfiguredTargets(config):
+    return [course.strip() for course in config['class']['class'].split(",") if course.strip()]
+
+
+def getTargetCartEntries(browser, config):
+    targets = getConfiguredTargets(config)
+    matches = []
+    for entry in getCartCourses(browser):
+        for target in targets:
+            if entry["course"].upper().startswith(target.upper()):
+                matches.append(entry)
+                break
+    return matches
+
+
+def submitCart(browser):
+    submit = WebDriverWait(browser, 30).until(
+        EC.element_to_be_clickable((By.ID, "submit-registration"))
+    )
+    submit.click()
+    time.sleep(2)
+
+
+def getSessionData():
+    global SESSION_DATA
+    if SESSION_DATA is None:
+        SESSION_DATA = browserFetchJson("api/session").get("json", {})
+    return SESSION_DATA
+
+
+def browserFetchJson(url):
+    if ACTIVE_BROWSER is None:
+        return {}
+    return ACTIVE_BROWSER.execute_async_script(
+        """
+        const url = arguments[0];
+        const done = arguments[arguments.length - 1];
+        fetch(url, { credentials: 'include' })
+          .then(async (response) => {
+            const text = await response.text();
+            let json = null;
+            try {
+              json = JSON.parse(text);
+            } catch (error) {}
+            done({ ok: response.ok, status: response.status, text, json });
+          })
+          .catch((error) => done({ ok: false, status: 0, error: String(error) }));
+        """,
+        url,
+    )
+
+
+def isCartEntryOpen(entry, term):
+    status = getPublicTimeScheduleStatus(entry["course"], entry["sln"], term)
+    if status is None:
+        print(getNow(), f"Could not determine open status for {entry['course']} ({entry['sln']}).")
+        return False
+    print(getNow(), f"{entry['course']} ({entry['sln']}) public status: {status}")
+    return status == "Open"
+
+
+def getPublicTimeScheduleStatus(courseText, sln, term):
+    subject = courseText.split()[0].lower()
+    termCode = getTimeScheduleTermCode(term)
+    url = f"https://www.washington.edu/students/timeschd/pub/{termCode}/{subject}.html"
+    try:
+        response = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    except Exception:
+        return None
+    if response.status_code != 200:
+        return None
+    text = html.unescape(response.text)
+    flattened = re.sub(r"<[^>]+>", " ", text)
+    flattened = re.sub(r"\s+", " ", flattened)
+    match = re.search(rf"\b{re.escape(sln)}\b.{{0,120}}?\b(Open|Closed)\b", flattened, re.IGNORECASE)
+    if match:
+        return match.group(1).title()
+    return None
+
+
+def getTimeScheduleTermCode(term):
+    parts = term.split()
+    if len(parts) != 2:
+        return term
+    quarterMap = {
+        "Winter": "WIN",
+        "Spring": "SPR",
+        "Summer": "SUM",
+        "Autumn": "AUT",
+    }
+    return quarterMap.get(parts[0], parts[0][:3].upper()) + parts[1]
 
 
 main()
