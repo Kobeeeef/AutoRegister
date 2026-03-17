@@ -1,7 +1,7 @@
-import requests
 import json
 import time
 from datetime import datetime
+import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -12,7 +12,7 @@ import os
 import sys
 import re
 import html
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus, urljoin
 
 
 ACTIVE_BROWSER = None
@@ -33,24 +33,29 @@ def main():
             term = getTerm(browser)
             enrolled = getEnrolledClass(browser)
             cartCourses = getCartCourses(browser)
+            mode = config['class'].get('mode', 'cart').strip().lower()
+            useDirectMode = mode == 'direct'
 
             times = getEnrolledTime(enrolled, term)
             credits = getTotalCredits(browser)
             courses = initializeCourses(config, enrolled)
-            if len(courses) > 0:
+            if useDirectMode and len(courses) > 0:
                 writeCoursesToConfig(config, courses, fileName)
             timeBlacklist = generateTimeBlacklist(courses, times, term)
             restrictedBlacklist = initializeBlacklist(config, courses)
             writeBlacklistToConfig(config, restrictedBlacklist, fileName)
             goal = int(config['class']['goal'])
-            if goal <= credits and len(courses) > 0:
+            if goal <= credits and useDirectMode and len(courses) > 0:
                 goal = credits + 1
                 print(f"Configured goal is not above current credits. Using temporary goal of {goal}.")
-            print("Checking for availability for:")
-            for course in courses:
-                print(course)
-            if len(courses) == 0 and config['class']['class'].strip():
-                print("Falling back to cart-driven mode. Import the target section into your Registration Cart.")
+            if useDirectMode:
+                print("Checking for availability for:")
+                for course in courses:
+                    print(course)
+                if len(courses) == 0 and config['class']['class'].strip():
+                    print("Falling back to cart-driven mode. Import the target section into your Registration Cart.")
+            else:
+                print("Using cart-driven mode. Put the target section in your Registration Cart.")
             print("Please do not manually drop or sign up classes. \n")
             last = []
             interval = 3600 * 9 # 3 hours
@@ -66,7 +71,7 @@ def main():
                               config['setup']['password'])
                         print("Logged out. Logging back in.")
                     nextRefresh = time.time() + interval
-                if len(courses) > 0:
+                if useDirectMode and len(courses) > 0:
                     openList = getClassStatus(
                         courses, term, timeBlacklist, restrictedBlacklist)
                     if len(openList) > 0 and last != openList:
@@ -98,8 +103,8 @@ def main():
                     for entry in targetCartEntries:
                         if isCartEntryOpen(entry, term):
                             openEntries.append(entry)
-                    if len(openEntries) > 0:
-                        print(getNow(), "Target cart section is open. Attempting Update Schedule.")
+                    if len(openEntries) == len(targetCartEntries):
+                        print(getNow(), "All target cart sections are open. Attempting Update Schedule.")
                         submitCart(browser)
                         getMessage(browser, restrictedBlacklist, config)
                         enrolled = getEnrolledClass(browser)
@@ -108,7 +113,7 @@ def main():
                             print("Enrolled in target cart course.")
                             break
                     else:
-                        print(getNow(), "Target course is in the Registration Cart, but the section is still closed.")
+                        print(getNow(), f"Target course is in the Registration Cart, but only {len(openEntries)}/{len(targetCartEntries)} matching entries are currently open.")
                 else:
                     print(getNow(), "Target course is not in the Registration Cart yet.")
                 time.sleep(cartPollSeconds)
@@ -142,6 +147,7 @@ def initializeConfig(fileName):
         }
         config['class'] = {
             'class': 'PSYCH 210',
+            'mode': 'cart',
             'goal': '18',
             'blacklist': '',
             'cartPollSeconds': '60'
@@ -153,6 +159,15 @@ def initializeConfig(fileName):
     else:
         print("Config found at", fileName)
         config.read(fileName)
+        changed = False
+        if 'class' not in config:
+            config['class'] = {}
+            changed = True
+        if 'mode' not in config['class']:
+            config['class']['mode'] = 'cart'
+            changed = True
+        if changed:
+            config.write(open(fileName, 'w'))
         return config
 
 
@@ -201,12 +216,12 @@ def getEnrolledTime(enrolled, term):
     for course in enrolled:
         parser = getCourseJson(course)
         if parser:
-            for n1 in parser['courseOfferingInstitutionList']:
-                for n2 in n1['courseOfferingTermList']:
-                    if n2['term'] == term:
-                        for section in n2['activityOfferingItemList']:
-                            if section['code'] in enrolled[course]:
-                                for meetingTime in section['meetingDetailsList']:
+            for n1 in parser.get('courseOfferingInstitutionList', []):
+                for n2 in n1.get('courseOfferingTermList', []):
+                    if n2.get('term') == term:
+                        for section in n2.get('activityOfferingItemList', []):
+                            if section.get('code') in enrolled[course]:
+                                for meetingTime in section.get('meetingDetailsList', []):
                                     res.append(meetingTime)
     return res
 
@@ -250,7 +265,11 @@ def getMessage(browser, restrictedBlacklist, config):
 
 def getCourseName(parser):
     if parser:
-        return parser['courseSummaryDetails']['subjectArea'] + ' ' + parser['courseSummaryDetails']['courseNumber']
+        summary = parser.get('courseSummaryDetails', {})
+        subject = summary.get('subjectArea')
+        number = summary.get('courseNumber')
+        if subject and number:
+            return subject + ' ' + number
 
 
 def generateTimeBlacklist(courses, times, term):
@@ -258,13 +277,15 @@ def generateTimeBlacklist(courses, times, term):
     for course in courses:
         parser = getCourseJson(course)
         if parser:
-            for n1 in parser['courseOfferingInstitutionList']:
-                for n2 in n1['courseOfferingTermList']:
-                    if n2['term'] == term:
-                        for section in n2['activityOfferingItemList']:
-                            for meetingTime in section['meetingDetailsList']:
+            for n1 in parser.get('courseOfferingInstitutionList', []):
+                for n2 in n1.get('courseOfferingTermList', []):
+                    if n2.get('term') == term:
+                        for section in n2.get('activityOfferingItemList', []):
+                            for meetingTime in section.get('meetingDetailsList', []):
                                 if overlaps(meetingTime, times):
-                                    res.add(course + " " + section['code'])
+                                    code = section.get('code')
+                                    if code:
+                                        res.add(course + " " + code)
     return res
 
 
@@ -321,26 +342,31 @@ def getClassStatus(courses, term, timeBlacklist, restrictedBlacklist):
         parser = getCourseJson(course)
         if parser:
             status = {}
-            for n1 in parser['courseOfferingInstitutionList']:
-                for n2 in n1['courseOfferingTermList']:
-                    if n2['term'] == term:
-                        for section in n2['activityOfferingItemList']:
-                            fullCourseName = course + ' ' + section['code']
+            for n1 in parser.get('courseOfferingInstitutionList', []):
+                for n2 in n1.get('courseOfferingTermList', []):
+                    if n2.get('term') == term:
+                        for section in n2.get('activityOfferingItemList', []):
+                            code = section.get('code')
+                            if not code:
+                                continue
+                            fullCourseName = course + ' ' + code
                             if not fullCourseName in timeBlacklist and not fullCourseName in restrictedBlacklist:
-                                if len(section['code']) == 1:
-                                    if section['enrollStatus'] == 'open' and section['addCodeRequired'] == 'false':
-                                        status[section['code']] = {
-                                            'registrationCode': section['registrationCode']
+                                if len(code) == 1:
+                                    if section.get('enrollStatus') == 'open' and section.get('addCodeRequired') == 'false':
+                                        status[code] = {
+                                            'registrationCode': section.get('registrationCode')
                                         }
                                 else:
-                                    if section['code'][0] in status:
-                                        sectionType = section['activityOfferingType']
-                                        if not sectionType in status[section['code'][0]]:
-                                            status[section['code'][0]
+                                    if code[0] in status:
+                                        sectionType = section.get('activityOfferingType')
+                                        if not sectionType:
+                                            continue
+                                        if not sectionType in status[code[0]]:
+                                            status[code[0]
                                                    ][sectionType] = {}
-                                        if section['enrollStatus'] == 'open' and section['addCodeRequired'] == 'false':
-                                            status[section['code'][0]][sectionType][section['code']] = {
-                                                'registrationCode': section['registrationCode']
+                                        if section.get('enrollStatus') == 'open' and section.get('addCodeRequired') == 'false':
+                                            status[code[0]][sectionType][code] = {
+                                                'registrationCode': section.get('registrationCode')
                                             }
             for lecture in status:
                 canEnroll = True
@@ -405,11 +431,41 @@ def writeBlacklistToConfig(config, blacklist, fileName):
 
 
 def getCourseJson(course):
-    response = browserFetchJson(getCourseLink(course))
-    if response and response.get("ok") and isinstance(response.get("json"), dict):
-        return response["json"]
+    response = fetchJson(getCourseLink(course))
+    payload = normalizeCourseJson(response.get("json") if response else None)
+    if response and response.get("ok") and payload:
+        return payload
     status = response.get("status") if response else "unknown"
     print(getNow(), getCourseLink(course), f"error while attempting to load (status: {status})")
+    if isinstance(response.get("json") if response else None, dict):
+        keys = sorted(list((response.get("json") or {}).keys()))
+        if len(keys) > 0:
+            print(getNow(), getCourseLink(course), f"unexpected response keys: {', '.join(keys[:10])}")
+            next_target = (response.get("json") or {}).get("next")
+            if isinstance(next_target, str) and next_target.strip():
+                print(getNow(), getCourseLink(course), f"response next target: {next_target}")
+        else:
+            print(getNow(), getCourseLink(course), "unexpected empty JSON object returned.")
+
+
+def normalizeCourseJson(payload):
+    if isCourseDetailsPayload(payload):
+        return payload
+    if not isinstance(payload, dict):
+        return None
+    for key in ("data", "course", "result", "payload"):
+        nested = payload.get(key)
+        if isCourseDetailsPayload(nested):
+            return nested
+    return None
+
+
+def isCourseDetailsPayload(payload):
+    return (
+        isinstance(payload, dict) and
+        isinstance(payload.get("courseSummaryDetails"), dict) and
+        isinstance(payload.get("courseOfferingInstitutionList"), list)
+    )
 
 
 def getCourseLink(course):
@@ -543,6 +599,181 @@ def getSessionData():
     return SESSION_DATA
 
 
+def fetchJson(url):
+    if not isinstance(url, str):
+        return {}
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        return browserFetchJson(url)
+    response = fetchJsonWithFetcher(url, requestsFetchJson)
+    payload = normalizeCourseJson(response.get("json") if response else None)
+    if response.get("ok") and payload:
+        return response
+    browser_response = fetchJsonWithFetcher(url, browserTabFetchJson)
+    browser_payload = normalizeCourseJson(browser_response.get("json") if browser_response else None)
+    if browser_response.get("ok") and browser_payload:
+        return browser_response
+    if browser_response.get("json") is not None:
+        return browser_response
+    return response
+
+
+def fetchJsonWithFetcher(url, fetcher, max_hops=4):
+    current_url = url
+    last_response = {}
+    for _ in range(max_hops):
+        response = fetcher(current_url)
+        if not isinstance(response, dict):
+            return {}
+        if response.get("final_url") is None:
+            response["final_url"] = current_url
+        last_response = response
+        payload = normalizeCourseJson(response.get("json"))
+        if payload:
+            return response
+        next_target = getJsonNextTarget(response.get("json"))
+        if not next_target:
+            return response
+        current_url = urljoin(response.get("final_url") or current_url, next_target)
+    return last_response
+
+
+def getJsonNextTarget(payload):
+    if not isinstance(payload, dict):
+        return None
+    next_target = payload.get("next")
+    if isinstance(next_target, str) and next_target.strip():
+        return next_target.strip()
+    return None
+
+
+def requestsFetchJson(url):
+    cookies = getAllBrowserCookies()
+    session = requests.Session()
+    for cookie in cookies:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not name:
+            continue
+        session.cookies.set(
+            name,
+            value,
+            domain=cookie.get("domain"),
+            path=cookie.get("path", "/"),
+        )
+    try:
+        response = session.get(
+            url,
+            timeout=30,
+            allow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json, text/plain, */*",
+            },
+        )
+    except Exception as error:
+        return {"ok": False, "status": 0, "error": Stringify(error)}
+    text = response.text
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    return {
+        "ok": response.ok,
+        "status": response.status_code,
+        "text": text,
+        "json": payload,
+        "final_url": response.url,
+    }
+
+
+def browserTabFetchJson(url):
+    if ACTIVE_BROWSER is None:
+        return {}
+    original_handle = None
+    new_handle = None
+    try:
+        original_handle = ACTIVE_BROWSER.current_window_handle
+        handles_before = set(ACTIVE_BROWSER.window_handles)
+        ACTIVE_BROWSER.execute_script("window.open(arguments[0], '_blank');", url)
+        handles_after = set(ACTIVE_BROWSER.window_handles)
+        new_handles = list(handles_after - handles_before)
+        if len(new_handles) == 0:
+            return {"ok": False, "status": 0}
+        new_handle = new_handles[0]
+        ACTIVE_BROWSER.switch_to.window(new_handle)
+        WebDriverWait(ACTIVE_BROWSER, 30).until(
+            lambda driver: driver.execute_script("return document.readyState") == "complete"
+        )
+        body_text = ACTIVE_BROWSER.find_element(By.TAG_NAME, "body").text.strip()
+        page_source = ACTIVE_BROWSER.page_source
+        payload = parseJsonText(body_text)
+        if payload is None:
+            payload = parseJsonText(page_source)
+        return {
+            "ok": payload is not None,
+            "status": 200 if payload is not None else 0,
+            "text": body_text,
+            "json": payload,
+            "final_url": ACTIVE_BROWSER.current_url,
+        }
+    except Exception as error:
+        return {"ok": False, "status": 0, "error": Stringify(error)}
+    finally:
+        try:
+            if new_handle and new_handle in ACTIVE_BROWSER.window_handles:
+                ACTIVE_BROWSER.close()
+        except Exception:
+            pass
+        try:
+            if original_handle and original_handle in ACTIVE_BROWSER.window_handles:
+                ACTIVE_BROWSER.switch_to.window(original_handle)
+        except Exception:
+            pass
+
+
+def parseJsonText(text):
+    if not text:
+        return None
+    text = text.strip()
+    if text.startswith("<"):
+        match = re.search(r"<pre[^>]*>(.*?)</pre>", text, re.IGNORECASE | re.DOTALL)
+        if match:
+            text = match.group(1).strip()
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def getAllBrowserCookies():
+    if ACTIVE_BROWSER is None:
+        return []
+    try:
+        result = ACTIVE_BROWSER.execute_cdp_cmd("Network.getAllCookies", {})
+        cookies = result.get("cookies", [])
+        if isinstance(cookies, list):
+            return cookies
+    except Exception:
+        pass
+    try:
+        cookies = ACTIVE_BROWSER.get_cookies()
+        if isinstance(cookies, list):
+            return cookies
+    except Exception:
+        pass
+    return []
+
+
+def Stringify(value):
+    try:
+        return str(value)
+    except Exception:
+        return "unknown error"
+
+
 def browserFetchJson(url):
     if ACTIVE_BROWSER is None:
         return {}
@@ -566,44 +797,218 @@ def browserFetchJson(url):
 
 
 def isCartEntryOpen(entry, term):
-    status = getPublicTimeScheduleStatus(entry["course"], entry["sln"], term)
+    status = getRegistrationStatus(entry["course"], entry["sln"], term)
     if status is None:
         print(getNow(), f"Could not determine open status for {entry['course']} ({entry['sln']}).")
         return False
-    print(getNow(), f"{entry['course']} ({entry['sln']}) public status: {status}")
+    print(getNow(), f"{entry['course']} ({entry['sln']}) live status: {status}")
     return status == "Open"
 
 
-def getPublicTimeScheduleStatus(courseText, sln, term):
-    subject = courseText.split()[0].lower()
-    termCode = getTimeScheduleTermCode(term)
-    url = f"https://www.washington.edu/students/timeschd/pub/{termCode}/{subject}.html"
-    try:
-        response = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-    except Exception:
+def getRegistrationStatus(courseText, sln, term):
+    curriculum = getCurriculumFromCartText(courseText)
+    url = getEnrollmentSummaryUrl(term, curriculum)
+    print(getNow(), f"[debug] Checking enrollment summary for {courseText} ({sln}) via {url}")
+    page = fetchEnrollmentSummaryPage(url)
+    if not page:
+        print(getNow(), f"[debug] No usable enrollment summary page returned for {url}")
         return None
-    if response.status_code != 200:
+    row = getEnrollmentSummaryRow(page, sln)
+    if not row:
+        print(getNow(), f"[debug] SLN {sln} not found in enrollment summary for {url}")
         return None
-    text = html.unescape(response.text)
-    flattened = re.sub(r"<[^>]+>", " ", text)
-    flattened = re.sub(r"\s+", " ", flattened)
-    match = re.search(rf"\b{re.escape(sln)}\b.{{0,120}}?\b(Open|Closed)\b", flattened, re.IGNORECASE)
-    if match:
-        return match.group(1).title()
-    return None
+    print(
+        getNow(),
+        f"[debug] Summary row for SLN {sln}: course={row.get('course')!r}, "
+        f"section={row.get('section')!r}, space_available={row.get('space_available')!r}, "
+        f"notes={row.get('notes')!r}"
+    )
+    notes = row.get("notes", "")
+    if "section withdrawn" in notes.lower():
+        return "Withdrawn"
+    if "entry code required" in notes.lower():
+        return "Add Code Required"
+    space = row.get("space_available")
+    if space is None:
+        return None
+    if space > 0:
+        return "Open"
+    return "Closed"
 
 
-def getTimeScheduleTermCode(term):
+def getCourseFromCartText(courseText):
+    parts = courseText.split()
+    if len(parts) >= 2:
+        return parts[0] + ' ' + parts[1]
+    return courseText.strip()
+
+
+def getCurriculumFromCartText(courseText):
+    parts = courseText.split()
+    if len(parts) >= 1:
+        return parts[0]
+    return courseText.strip()
+
+
+def getEnrollmentSummaryUrl(term, curriculum):
+    qtryr = getEnrollmentSummaryTerm(term)
+    return (
+        "https://sdb.admin.uw.edu/timeschd/uwnetid/tsstat.asp?"
+        f"QTRYR={quote_plus(qtryr)}&CURRIC={quote_plus(curriculum)}"
+    )
+
+
+def getEnrollmentSummaryTerm(term):
     parts = term.split()
     if len(parts) != 2:
         return term
-    quarterMap = {
+    quarter_map = {
         "Winter": "WIN",
         "Spring": "SPR",
         "Summer": "SUM",
         "Autumn": "AUT",
     }
-    return quarterMap.get(parts[0], parts[0][:3].upper()) + parts[1]
+    return f"{quarter_map.get(parts[0], parts[0][:3].upper())} {parts[1]}"
+
+
+def fetchEnrollmentSummaryPage(url):
+    response = requestsFetchText(url)
+    requests_ok = isEnrollmentSummaryHtml(response.get("text"))
+    print(
+        getNow(),
+        f"[debug] Enrollment summary requests fetch: status={response.get('status')}, "
+        f"final_url={response.get('final_url')}, html_ok={requests_ok}, error={response.get('error')}"
+    )
+    if requests_ok:
+        return response.get("text")
+    response = browserTabFetchText(url)
+    browser_ok = isEnrollmentSummaryHtml(response.get("text"))
+    print(
+        getNow(),
+        f"[debug] Enrollment summary browser fetch: status={response.get('status')}, "
+        f"final_url={response.get('final_url')}, html_ok={browser_ok}, error={response.get('error')}"
+    )
+    if browser_ok:
+        return response.get("text")
+    return None
+
+
+def requestsFetchText(url):
+    cookies = getAllBrowserCookies()
+    session = requests.Session()
+    for cookie in cookies:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not name:
+            continue
+        session.cookies.set(
+            name,
+            value,
+            domain=cookie.get("domain"),
+            path=cookie.get("path", "/"),
+        )
+    try:
+        response = session.get(
+            url,
+            timeout=30,
+            allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+    except Exception as error:
+        return {"ok": False, "status": 0, "text": "", "error": Stringify(error)}
+    return {
+        "ok": response.ok,
+        "status": response.status_code,
+        "text": response.text,
+        "final_url": response.url,
+    }
+
+
+def browserTabFetchText(url):
+    if ACTIVE_BROWSER is None:
+        return {}
+    original_handle = None
+    new_handle = None
+    try:
+        original_handle = ACTIVE_BROWSER.current_window_handle
+        handles_before = set(ACTIVE_BROWSER.window_handles)
+        ACTIVE_BROWSER.execute_script("window.open(arguments[0], '_blank');", url)
+        handles_after = set(ACTIVE_BROWSER.window_handles)
+        new_handles = list(handles_after - handles_before)
+        if len(new_handles) == 0:
+            return {"ok": False, "status": 0, "text": ""}
+        new_handle = new_handles[0]
+        ACTIVE_BROWSER.switch_to.window(new_handle)
+        WebDriverWait(ACTIVE_BROWSER, 30).until(
+            lambda driver: driver.execute_script("return document.readyState") == "complete"
+        )
+        return {
+            "ok": True,
+            "status": 200,
+            "text": ACTIVE_BROWSER.page_source,
+            "final_url": ACTIVE_BROWSER.current_url,
+        }
+    except Exception as error:
+        return {"ok": False, "status": 0, "text": "", "error": Stringify(error)}
+    finally:
+        try:
+            if new_handle and new_handle in ACTIVE_BROWSER.window_handles:
+                ACTIVE_BROWSER.close()
+        except Exception:
+            pass
+        try:
+            if original_handle and original_handle in ACTIVE_BROWSER.window_handles:
+                ACTIVE_BROWSER.switch_to.window(original_handle)
+        except Exception:
+            pass
+
+
+def isEnrollmentSummaryHtml(text):
+    if not text:
+        return False
+    return "Time Schedule Enrollment Summary" in text and "Space" in text and "Available" in text
+
+
+def getEnrollmentSummaryRow(page, sln):
+    row_html = None
+    sln_text = str(sln).strip()
+    for match in re.finditer(r"<tr\b[^>]*>.*?</tr>", page, re.IGNORECASE | re.DOTALL):
+        candidate = match.group(0)
+        if re.search(rf"SLN={re.escape(sln_text)}(?:\"|&|')", candidate, re.IGNORECASE):
+            row_html = candidate
+            break
+    if not row_html:
+        title_match = re.search(r"<title>(.*?)</title>", page, re.IGNORECASE | re.DOTALL)
+        page_title = cleanHtmlCell(title_match.group(1)) if title_match else ""
+        print(getNow(), f"[debug] Could not find SLN {sln} in page title={page_title!r}")
+        return None
+    cells = re.findall(r"<td\b[^>]*>(.*?)</td>", row_html, re.IGNORECASE | re.DOTALL)
+    if len(cells) < 11:
+        print(getNow(), f"[debug] SLN {sln} row had only {len(cells)} td cells")
+        return None
+    return {
+        "course": cleanHtmlCell(cells[1]),
+        "section": cleanHtmlCell(cells[2]),
+        "space_available": parseSummaryNumber(cells[8]),
+        "notes": cleanHtmlCell(cells[10]),
+    }
+
+
+def cleanHtmlCell(value):
+    value = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = html.unescape(value)
+    value = re.sub(r"[ \t\r\f\v]+", " ", value)
+    value = re.sub(r"\n+", "\n", value)
+    return value.strip()
+
+
+def parseSummaryNumber(value):
+    text = cleanHtmlCell(value)
+    match = re.search(r"\d+", text)
+    if match:
+        return int(match.group(0))
+    return None
 
 
 main()
