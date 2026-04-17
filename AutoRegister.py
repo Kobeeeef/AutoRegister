@@ -1,9 +1,10 @@
 import requests
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.edge.service import Service as EdgeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -30,10 +31,14 @@ def main():
         login(browser, config['setup']['username'],
               config['setup']['password'])
         if not checkLogin(browser):
+            registerMode = config['class'].get('mode', 'availability').strip().lower()
+            if registerMode == 'timed_cart':
+                print("Timed cart mode enabled. Skipping course availability checks.")
+                print("Please do not manually drop or sign up classes. \n")
+                runTimedCartMode(browser, config, set())
+                return
             term = getTerm(browser)
             enrolled = getEnrolledClass(browser)
-            cartCourses = getCartCourses(browser)
-
             times = getEnrolledTime(enrolled, term)
             credits = getTotalCredits(browser)
             courses = initializeCourses(config, enrolled)
@@ -136,15 +141,22 @@ def initializeConfig(fileName):
         config['setup'] = {
             'username': '',
             'password': '',
+            'browser': 'edge',
             'driverPath': '',
             'chromeUserDataDir': '',
-            'chromeProfileDirectory': 'Default'
+            'chromeProfileDirectory': 'Default',
+            'edgeUserDataDir': '',
+            'edgeProfileDirectory': 'Default'
         }
         config['class'] = {
             'class': 'PSYCH 210',
             'goal': '18',
             'blacklist': '',
-            'cartPollSeconds': '60'
+            'cartPollSeconds': '60',
+            'mode': 'availability',
+            'registerTime': '06:00',
+            'registerSpamSeconds': '2',
+            'timedCartStopAfterMinutes': '15'
         }
         config.write(open(fileName, 'w'))
         print('Config file created at ', fileName)
@@ -228,6 +240,28 @@ def addClass(browser, openList):
     )
     submit.click()
     time.sleep(2)
+
+
+def runTimedCartMode(browser, config, restrictedBlacklist):
+    registerTime = config['class'].get('registerTime', '06:00').strip()
+    spamSeconds = float(config['class'].get('registerSpamSeconds', '2'))
+    stopAfterMinutes = float(config['class'].get('timedCartStopAfterMinutes', '15'))
+    if spamSeconds <= 0:
+        spamSeconds = 2
+    if stopAfterMinutes <= 0:
+        stopAfterMinutes = 15
+    runAt = waitUntilRegisterTime(registerTime)
+    stopAt = runAt + timedelta(minutes=stopAfterMinutes)
+    print(getNow(), f"Timed cart mode will stop at {stopAt.strftime('%Y-%m-%d %H:%M:%S')} if not interrupted first.")
+    while datetime.now() < stopAt:
+        if checkLogin(browser):
+            print(getNow(), "Session is no longer on the registration page. Waiting for manual login.")
+            login(browser, config['setup']['username'], config['setup']['password'])
+        print(getNow(), "Timed cart mode submitting registration.")
+        submitCart(browser)
+        getMessage(browser, restrictedBlacklist, config)
+        time.sleep(spamSeconds)
+    print(getNow(), "Timed cart mode reached the stop window and is exiting.")
 
 
 def getMessage(browser, restrictedBlacklist, config):
@@ -430,26 +464,85 @@ def getNow():
     return datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S')
 
 
+def waitUntilRegisterTime(registerTime):
+    target = parseRegisterTime(registerTime)
+    now = datetime.now()
+    runAt = now.replace(hour=target.hour, minute=target.minute, second=0, microsecond=0)
+    if now >= runAt:
+        print(getNow(), f"Register time {registerTime} has already passed today. Starting immediately.")
+        return now
+    print(getNow(), f"Timed cart mode waiting until {runAt.strftime('%Y-%m-%d %H:%M:%S')}.")
+    lastPrintedSeconds = None
+    while True:
+        now = datetime.now()
+        if now >= runAt:
+            print(getNow(), "Timed cart mode reached the register time.")
+            return runAt
+        remaining = (runAt - now).total_seconds()
+        roundedRemaining = int(remaining)
+        if lastPrintedSeconds is None or lastPrintedSeconds - roundedRemaining >= 30 or roundedRemaining <= 10:
+            print(getNow(), f"Timed cart mode waiting... {formatDuration(roundedRemaining)} remaining.")
+            lastPrintedSeconds = roundedRemaining
+        time.sleep(min(remaining, 30))
+
+
+def parseRegisterTime(registerTime):
+    for timeFormat in ("%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(registerTime, timeFormat)
+        except ValueError:
+            continue
+    raise ValueError(f"Invalid registerTime '{registerTime}'. Use HH:MM or HH:MM:SS.")
+
+
+def formatDuration(totalSeconds):
+    totalSeconds = max(0, int(totalSeconds))
+    hours, remainder = divmod(totalSeconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours} hrs {minutes} mins {seconds} secs remaining"
+
+
 def createBrowser(config):
+    browserName = config['setup'].get('browser', 'edge').strip().lower()
     driverPath = config['setup'].get('driverPath', '').strip()
-    chromeUserDataDir = config['setup'].get('chromeUserDataDir', '').strip()
-    chromeProfileDirectory = config['setup'].get('chromeProfileDirectory', '').strip()
-    if not chromeUserDataDir:
+    if browserName == 'chrome':
+        userDataDir = config['setup'].get('chromeUserDataDir', '').strip()
+        profileDirectory = config['setup'].get('chromeProfileDirectory', '').strip()
+        if not userDataDir:
+            localAppData = os.environ.get("LOCALAPPDATA", "").strip()
+            if localAppData:
+                defaultChromeDir = os.path.join(localAppData, "Google", "Chrome", "User Data")
+                if os.path.isdir(defaultChromeDir):
+                    userDataDir = defaultChromeDir
+        options = webdriver.ChromeOptions()
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        if userDataDir:
+            options.add_argument(f"--user-data-dir={userDataDir}")
+        if profileDirectory:
+            options.add_argument(f"--profile-directory={profileDirectory}")
+        if driverPath:
+            return webdriver.Chrome(service=Service(driverPath), options=options)
+        return webdriver.Chrome(options=options)
+
+    userDataDir = config['setup'].get('edgeUserDataDir', '').strip()
+    profileDirectory = config['setup'].get('edgeProfileDirectory', '').strip()
+    if not userDataDir:
         localAppData = os.environ.get("LOCALAPPDATA", "").strip()
         if localAppData:
-            defaultChromeDir = os.path.join(localAppData, "Google", "Chrome", "User Data")
-            if os.path.isdir(defaultChromeDir):
-                chromeUserDataDir = defaultChromeDir
-    options = webdriver.ChromeOptions()
+            defaultEdgeDir = os.path.join(localAppData, "Microsoft", "Edge", "User Data")
+            if os.path.isdir(defaultEdgeDir):
+                userDataDir = defaultEdgeDir
+    options = webdriver.EdgeOptions()
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
-    if chromeUserDataDir:
-        options.add_argument(f"--user-data-dir={chromeUserDataDir}")
-    if chromeProfileDirectory:
-        options.add_argument(f"--profile-directory={chromeProfileDirectory}")
+    if userDataDir:
+        options.add_argument(f"--user-data-dir={userDataDir}")
+    if profileDirectory:
+        options.add_argument(f"--profile-directory={profileDirectory}")
     if driverPath:
-        return webdriver.Chrome(service=Service(driverPath), options=options)
-    return webdriver.Chrome(options=options)
+        return webdriver.Edge(service=EdgeService(driverPath), options=options)
+    return webdriver.Edge(options=options)
 
 
 def needsManualLogin(id, pw):
