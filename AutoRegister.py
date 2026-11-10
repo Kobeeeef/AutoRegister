@@ -8,6 +8,7 @@ from selenium.webdriver.edge.service import Service as EdgeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
 import configparser
 import os
 import sys
@@ -26,8 +27,10 @@ def main():
     fileName = getFileName()
     config = initializeConfig(fileName)
     if config:
+        print(getNow(), f"Launching {config['setup'].get('browser', 'edge')} browser...", flush=True)
         browser = createBrowser(config)
         ACTIVE_BROWSER = browser
+        print(getNow(), "Browser opened. Loading UW registration page...", flush=True)
         login(browser, config['setup']['username'],
               config['setup']['password'])
         if not checkLogin(browser):
@@ -169,12 +172,13 @@ def initializeConfig(fileName):
 
 
 def login(browser, id, pw):
+    print(getNow(), "Opening UW registration page...", flush=True)
     browser.get("https://register.uw.edu/register/")
-    print("Manual login required. Complete the UW login and land on the registration page in the browser window.")
+    print(getNow(), "Complete UW login in the browser window if prompted.", flush=True)
     try:
         waitForRegistrationPage(browser, timeout=600)
-    except Exception:
-        print("Login timeout reached before the registration page loaded.")
+    except TimeoutException:
+        print(getNow(), "Still waiting for UW login or the registration page after 10 minutes.", flush=True)
 
 
 def checkLogin(browser):
@@ -253,13 +257,22 @@ def runTimedCartMode(browser, config, restrictedBlacklist):
     runAt = waitUntilRegisterTime(registerTime)
     stopAt = runAt + timedelta(minutes=stopAfterMinutes)
     print(getNow(), f"Timed cart mode will stop at {stopAt.strftime('%Y-%m-%d %H:%M:%S')} if not interrupted first.")
+    attempt = 0
     while datetime.now() < stopAt:
         if checkLogin(browser):
             print(getNow(), "Session is no longer on the registration page. Waiting for manual login.")
             login(browser, config['setup']['username'], config['setup']['password'])
-        print(getNow(), "Timed cart mode submitting registration.")
-        submitCart(browser)
-        getMessage(browser, restrictedBlacklist, config)
+            if checkLogin(browser):
+                continue
+        attempt += 1
+        print(getNow(), f"Registration attempt {attempt}: {len(getCartCourses(browser))} cart item(s); button {getRegisterButtonStatus()}.", flush=True)
+        try:
+            submitCart(browser)
+            print(getNow(), f"Registration attempt {attempt}: button clicked. Checking page messages...", flush=True)
+            getMessage(browser, restrictedBlacklist, config)
+        except TimeoutException:
+            print(getNow(), f"Registration attempt {attempt}: button was not clickable within 30 seconds.", flush=True)
+        print(getNow(), f"Waiting {spamSeconds:g} seconds before the next attempt.", flush=True)
         time.sleep(spamSeconds)
     print(getNow(), "Timed cart mode reached the stop window and is exiting.")
 
@@ -472,7 +485,6 @@ def waitUntilRegisterTime(registerTime):
         print(getNow(), f"Register time {registerTime} has already passed today. Starting immediately.")
         return now
     print(getNow(), f"Timed cart mode waiting until {runAt.strftime('%Y-%m-%d %H:%M:%S')}.")
-    lastPrintedSeconds = None
     while True:
         now = datetime.now()
         if now >= runAt:
@@ -480,10 +492,11 @@ def waitUntilRegisterTime(registerTime):
             return runAt
         remaining = (runAt - now).total_seconds()
         roundedRemaining = int(remaining)
-        if lastPrintedSeconds is None or lastPrintedSeconds - roundedRemaining >= 30 or roundedRemaining <= 10:
-            print(getNow(), f"Timed cart mode waiting... {formatDuration(roundedRemaining)} remaining.")
-            lastPrintedSeconds = roundedRemaining
-        time.sleep(min(remaining, 30))
+        if isRegistrationPage(ACTIVE_BROWSER):
+            print(getNow(), f"Waiting for {registerTime}: {formatDuration(roundedRemaining)}; {len(getCartCourses(ACTIVE_BROWSER))} cart item(s); register button {getRegisterButtonStatus()}.", flush=True)
+        else:
+            print(getNow(), f"Waiting for {registerTime}: {formatDuration(roundedRemaining)}; {getPageWaitStatus(ACTIVE_BROWSER)}.", flush=True)
+        time.sleep(min(remaining, 5))
 
 
 def parseRegisterTime(registerTime):
@@ -502,6 +515,23 @@ def formatDuration(totalSeconds):
     return f"{hours} hrs {minutes} mins {seconds} secs remaining"
 
 
+def getRegisterButtonStatus():
+    if ACTIVE_BROWSER is None:
+        return "not found"
+    try:
+        buttons = ACTIVE_BROWSER.find_elements(By.ID, "submit-registration")
+        if len(buttons) == 0:
+            return "not found"
+        button = buttons[0]
+        if not button.is_displayed():
+            return "found but hidden"
+        if not button.is_enabled():
+            return "found but disabled"
+        return "found and enabled"
+    except WebDriverException:
+        return "unavailable while page loads"
+
+
 def createBrowser(config):
     browserName = config['setup'].get('browser', 'edge').strip().lower()
     driverPath = config['setup'].get('driverPath', '').strip()
@@ -509,11 +539,8 @@ def createBrowser(config):
         userDataDir = config['setup'].get('chromeUserDataDir', '').strip()
         profileDirectory = config['setup'].get('chromeProfileDirectory', '').strip()
         if not userDataDir:
-            localAppData = os.environ.get("LOCALAPPDATA", "").strip()
-            if localAppData:
-                defaultChromeDir = os.path.join(localAppData, "Google", "Chrome", "User Data")
-                if os.path.isdir(defaultChromeDir):
-                    userDataDir = defaultChromeDir
+            localAppData = os.environ.get("LOCALAPPDATA", "").strip() or os.path.expanduser("~")
+            userDataDir = os.path.join(localAppData, "AutoRegister", "ChromeUserData")
         options = webdriver.ChromeOptions()
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
@@ -528,11 +555,8 @@ def createBrowser(config):
     userDataDir = config['setup'].get('edgeUserDataDir', '').strip()
     profileDirectory = config['setup'].get('edgeProfileDirectory', '').strip()
     if not userDataDir:
-        localAppData = os.environ.get("LOCALAPPDATA", "").strip()
-        if localAppData:
-            defaultEdgeDir = os.path.join(localAppData, "Microsoft", "Edge", "User Data")
-            if os.path.isdir(defaultEdgeDir):
-                userDataDir = defaultEdgeDir
+        localAppData = os.environ.get("LOCALAPPDATA", "").strip() or os.path.expanduser("~")
+        userDataDir = os.path.join(localAppData, "AutoRegister", "EdgeUserData")
     options = webdriver.EdgeOptions()
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
@@ -559,7 +583,26 @@ def isRegistrationPage(browser):
 
 
 def waitForRegistrationPage(browser, timeout=120):
-    WebDriverWait(browser, timeout).until(lambda driver: isRegistrationPage(driver))
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutException("UW registration page did not become ready")
+        try:
+            WebDriverWait(browser, min(5, remaining)).until(isRegistrationPage)
+            print(getNow(), "UW registration page ready; register button " + getRegisterButtonStatus() + ".", flush=True)
+            return
+        except TimeoutException:
+            print(getNow(), getPageWaitStatus(browser) + f" ({int(max(0, deadline - time.monotonic()))} seconds until timeout).", flush=True)
+
+
+def getPageWaitStatus(browser):
+    try:
+        if "register.uw.edu/register/" in browser.current_url:
+            return "Waiting for registration page controls to load"
+        return "Waiting for UW login in the browser"
+    except WebDriverException:
+        return "Waiting for browser page to respond"
 
 
 def addToCart(browser, registrationCode):
