@@ -257,6 +257,7 @@ def runTimedCartMode(browser, config, restrictedBlacklist):
     runAt = waitUntilRegisterTime(registerTime)
     stopAt = runAt + timedelta(minutes=stopAfterMinutes)
     print(getNow(), f"Timed cart mode will stop at {stopAt.strftime('%Y-%m-%d %H:%M:%S')} if not interrupted first.")
+    enrolledBefore = getEnrolledClass(browser)
     attempt = 0
     while datetime.now() < stopAt:
         if checkLogin(browser):
@@ -264,14 +265,35 @@ def runTimedCartMode(browser, config, restrictedBlacklist):
             login(browser, config['setup']['username'], config['setup']['password'])
             if checkLogin(browser):
                 continue
+        cartEntries = getCartCourses(browser)
+        if not cartEntries:
+            print(getNow(), "Cart appears empty. Waiting 5 seconds for the page to settle...", flush=True)
+            time.sleep(5)
+            cartEntries = getCartCourses(browser)
+        if not cartEntries:
+            enrolledAfter = getEnrolledClass(browser)
+            newSections = {
+                course: sections - enrolledBefore.get(course, set())
+                for course, sections in enrolledAfter.items()
+                if sections - enrolledBefore.get(course, set())
+            }
+            if newSections:
+                for course, sections in sorted(newSections.items()):
+                    print(getNow(), f"Current schedule now lists {course} section(s) {', '.join(sorted(sections))}.", flush=True)
+            else:
+                print(getNow(), "No new enrolled sections found on the page.", flush=True)
+            print(getNow(), "Cart is empty; stopping instead of clicking Register again. Check your UW schedule for the final result.", flush=True)
+            return
         attempt += 1
-        print(getNow(), f"Registration attempt {attempt}: {len(getCartCourses(browser))} cart item(s); button {getRegisterButtonStatus()}.", flush=True)
+        print(getNow(), f"Registration attempt {attempt}: {len(cartEntries)} cart item(s); button {getRegisterButtonStatus()}.", flush=True)
         try:
             submitCart(browser)
             print(getNow(), f"Registration attempt {attempt}: button clicked. Checking page messages...", flush=True)
             getMessage(browser, restrictedBlacklist, config)
         except TimeoutException:
             print(getNow(), f"Registration attempt {attempt}: button was not clickable within 30 seconds.", flush=True)
+        except WebDriverException as error:
+            print(getNow(), f"Registration attempt {attempt}: browser click failed ({type(error).__name__}). Will check the cart before retrying.", flush=True)
         print(getNow(), f"Waiting {spamSeconds:g} seconds before the next attempt.", flush=True)
         time.sleep(spamSeconds)
     print(getNow(), "Timed cart mode reached the stop window and is exiting.")
